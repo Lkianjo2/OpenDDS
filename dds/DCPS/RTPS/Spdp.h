@@ -19,8 +19,10 @@
 #include "dds/DCPS/ReactorTask.h"
 #include "dds/DCPS/PeriodicTask.h"
 #include "dds/DCPS/SporadicTask.h"
+#include "dds/DCPS/MultiTask.h"
 #include "dds/DCPS/JobQueue.h"
 #include "dds/DCPS/NetworkConfigMonitor.h"
+#include "dds/DCPS/RTPS/ICE/Ice.h"
 
 #include "RtpsCoreC.h"
 #include "Sedp.h"
@@ -110,7 +112,8 @@ public:
   void handle_participant_data(DCPS::MessageId id,
                                const ParticipantData_t& pdata,
                                const DCPS::SequenceNumber& seq,
-                               const ACE_INET_Addr& from);
+                               const ACE_INET_Addr& from,
+                               bool from_sedp);
 
   static bool validateSequenceNumber(const DCPS::SequenceNumber& seq, DiscoveredParticipantIter& iter);
 
@@ -139,6 +142,10 @@ public:
   DDS::Security::PermissionsHandle lookup_participant_permissions(const DCPS::RepoId& id) const;
 
   DCPS::AuthState lookup_participant_auth_state(const DCPS::RepoId& id) const;
+
+  void process_participant_ice(const ParameterList& plist,
+                               const ParticipantData_t& pdata,
+                               const DCPS::RepoId& guid);
 #endif
 
   DCPS::RcHandle<DCPS::JobQueue> job_queue() const { return tport_->job_queue_; }
@@ -147,20 +154,32 @@ public:
 
   u_short get_sedp_port() const { return sedp_.local_address().get_port_number(); }
 
+#ifdef ACE_HAS_IPV6
+  u_short get_ipv6_spdp_port() const { return tport_ ? tport_->ipv6_uni_port_ : 0; }
+
+  u_short get_ipv6_sedp_port() const { return sedp_.ipv6_local_address().get_port_number(); }
+#endif
+
   void sedp_rtps_relay_address(const ACE_INET_Addr& address) { sedp_.rtps_relay_address(address); }
 
   void sedp_stun_server_address(const ACE_INET_Addr& address) { sedp_.stun_server_address(address); }
 
   BuiltinEndpointSet_t available_builtin_endpoints() const { return available_builtin_endpoints_; }
 
-protected:
-  Sedp& endpoint_manager() { return sedp_; }
+  ICE::Endpoint* get_ice_endpoint_if_added();
 
   ParticipantData_t build_local_pdata(
 #ifdef OPENDDS_SECURITY
                                       Security::DiscoveredParticipantDataKind kind
 #endif
                                       );
+protected:
+  Sedp& endpoint_manager() { return sedp_; }
+
+#ifndef DDS_HAS_MINIMUM_BIT
+  void enqueue_location_update_i(DiscoveredParticipantIter iter, DCPS::ParticipantLocation mask, const ACE_INET_Addr& from);
+  void process_location_updates_i(DiscoveredParticipantIter iter);
+#endif
 
   bool announce_domain_participant_qos();
 
@@ -180,38 +199,45 @@ private:
 
   void data_received(const DataSubmessage& data, const ParameterList& plist, const ACE_INET_Addr& from);
 
-  void match_unauthenticated(const DCPS::RepoId& guid, DiscoveredParticipant& dp);
+  void match_unauthenticated(const DCPS::RepoId& guid, DiscoveredParticipantIter& dp_iter);
 
 #ifdef OPENDDS_SECURITY
-  bool match_authenticated(const DCPS::RepoId& guid, DiscoveredParticipant& dp);
+  bool match_authenticated(const DCPS::RepoId& guid, DiscoveredParticipantIter& dp_iter);
   void attempt_authentication(const DCPS::RepoId& guid, DiscoveredParticipant& dp);
   void update_agent_info(const DCPS::RepoId& local_guid, const ICE::AgentInfo& agent_info);
 #endif
 
-#ifndef DDS_HAS_MINIMUM_BIT
-  DCPS::ParticipantBuiltinTopicDataDataReaderImpl* part_bit();
-#endif /* DDS_HAS_MINIMUM_BIT */
-
-  struct SpdpTransport : public virtual DCPS::RcEventHandler, public virtual DCPS::NetworkConfigListener {
+  struct SpdpTransport : public virtual DCPS::RcEventHandler, public virtual DCPS::NetworkConfigListener
+#ifdef OPENDDS_SECURITY
+        , public ICE::Endpoint
+#endif
+{
     typedef size_t WriteFlags;
     static const WriteFlags SEND_TO_LOCAL = (1 << 0);
     static const WriteFlags SEND_TO_RELAY = (1 << 1);
 
-    SpdpTransport(Spdp* outer, bool securityGuids);
+    explicit SpdpTransport(Spdp* outer);
     ~SpdpTransport();
+
+    const ACE_SOCK_Dgram& choose_recv_socket(ACE_HANDLE h) const;
 
     virtual int handle_input(ACE_HANDLE h);
     virtual int handle_exception(ACE_HANDLE fd = ACE_INVALID_HANDLE);
 
     void open();
+    void shorten_local_sender_delay_i();
     void write(WriteFlags flags);
     void write_i(WriteFlags flags);
     void write_i(const DCPS::RepoId& guid, WriteFlags flags);
     void send(WriteFlags flags);
+    const ACE_SOCK_Dgram& choose_send_socket(const ACE_INET_Addr& addr) const;
     void send(const ACE_INET_Addr& addr);
     void close();
     void dispose_unregister();
     bool open_unicast_socket(u_short port_common, u_short participant_id);
+#ifdef ACE_HAS_IPV6
+    bool open_unicast_ipv6_socket(u_short port);
+#endif
     void acknowledge();
 
     void join_multicast_group(const DCPS::NetworkInterface& nic,
@@ -221,6 +247,18 @@ private:
                      const ACE_INET_Addr& address);
     void remove_address(const DCPS::NetworkInterface& interface,
                         const ACE_INET_Addr& address);
+
+    ICE::Endpoint* get_ice_endpoint();
+
+#ifdef OPENDDS_SECURITY
+    ICE::AddressListType host_addresses() const;
+    void send(const ACE_INET_Addr& address, const STUN::Message& message);
+    ACE_INET_Addr stun_server_address() const;
+  #ifndef DDS_HAS_MINIMUM_BIT
+    void ice_connect(const ICE::GuidSetType& guids, const ACE_INET_Addr& addr);
+    void ice_disconnect(const ICE::GuidSetType& guids, const ACE_INET_Addr& addr);
+  #endif
+#endif
 
     Spdp* outer_;
     Header hdr_;
@@ -232,8 +270,15 @@ private:
     ACE_SOCK_Dgram unicast_socket_;
     OPENDDS_STRING multicast_interface_;
     ACE_INET_Addr multicast_address_;
-    OPENDDS_STRING multicast_address_str_;
     ACE_SOCK_Dgram_Mcast multicast_socket_;
+#ifdef ACE_HAS_IPV6
+    u_short ipv6_uni_port_;
+    ACE_SOCK_Dgram unicast_ipv6_socket_;
+    OPENDDS_STRING multicast_ipv6_interface_;
+    ACE_INET_Addr multicast_ipv6_address_;
+    ACE_SOCK_Dgram_Mcast multicast_ipv6_socket_;
+    OPENDDS_SET(OPENDDS_STRING) joined_ipv6_interfaces_;
+#endif
     OPENDDS_SET(OPENDDS_STRING) joined_interfaces_;
     OPENDDS_SET(ACE_INET_Addr) send_addrs_;
     ACE_Message_Block buff_, wbuff_;
@@ -241,8 +286,9 @@ private:
     DCPS::RcHandle<DCPS::JobQueue> job_queue_;
     typedef DCPS::PmfPeriodicTask<SpdpTransport> SpdpPeriodic;
     typedef DCPS::PmfSporadicTask<SpdpTransport> SpdpSporadic;
+    typedef DCPS::PmfMultiTask<SpdpTransport> SpdpMulti;
     void send_local(const DCPS::MonotonicTimePoint& now);
-    DCPS::RcHandle<SpdpPeriodic> local_sender_;
+    DCPS::RcHandle<SpdpMulti> local_sender_;
 #ifdef OPENDDS_SECURITY
     void process_auth_deadlines(const DCPS::MonotonicTimePoint& now);
     DCPS::RcHandle<SpdpSporadic> auth_deadline_processor_;
@@ -254,22 +300,25 @@ private:
     void send_relay_beacon(const DCPS::MonotonicTimePoint& now);
     DCPS::RcHandle<SpdpPeriodic> relay_beacon_;
     bool network_is_unreachable_;
+    bool ice_endpoint_added_;
   } *tport_;
 
   struct ChangeMulticastGroup : public DCPS::JobQueue::Job {
     enum CmgAction {CMG_JOIN, CMG_LEAVE};
 
     ChangeMulticastGroup(DCPS::RcHandle<SpdpTransport> tport,
-                         const DCPS::NetworkInterface& nic, CmgAction action)
+                         const DCPS::NetworkInterface& nic, CmgAction action,
+                         bool all_interfaces = false)
       : tport_(tport)
       , nic_(nic)
       , action_(action)
+      , all_interfaces_(all_interfaces)
     {}
 
     void execute()
     {
       if (action_ == CMG_JOIN) {
-        tport_->join_multicast_group(nic_);
+        tport_->join_multicast_group(nic_, all_interfaces_);
       } else {
         tport_->leave_multicast_group(nic_);
       }
@@ -278,7 +327,20 @@ private:
     DCPS::RcHandle<SpdpTransport> tport_;
     DCPS::NetworkInterface nic_;
     CmgAction action_;
+    bool all_interfaces_;
   };
+
+#ifdef OPENDDS_SECURITY
+  class SendStun : public DCPS::JobQueue::Job {
+  public:
+    SendStun(SpdpTransport* tport, const ACE_INET_Addr& address, const STUN::Message& message) : tport_(tport), address_(address), message_(message) {}
+    void execute();
+  private:
+    SpdpTransport* tport_;
+    ACE_INET_Addr address_;
+    STUN::Message message_;
+  };
+#endif
 
   ACE_Event_Handler_var eh_; // manages our refcount on tport_
   bool eh_shutdown_;

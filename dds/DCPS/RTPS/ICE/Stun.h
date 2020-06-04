@@ -1,4 +1,3 @@
-
 /*
  *
  *
@@ -19,6 +18,7 @@
 #pragma once
 #endif /* ACE_LACKS_PRAGMA_ONCE */
 
+#include <cstring>
 #include <map>
 #include <string>
 #include <vector>
@@ -131,18 +131,42 @@ Attribute make_ice_controlling(ACE_UINT64 ice_tie_breaker);
 OpenDDS_Rtps_Export
 Attribute make_ice_controlled(ACE_UINT64 ice_tie_breaker);
 
-OpenDDS_Rtps_Export
-bool operator>>(DCPS::Serializer& serializer, Attribute& attribute);
-
-OpenDDS_Rtps_Export
-bool operator<<(DCPS::Serializer& serializer, const Attribute& attribute);
-
 struct OpenDDS_Rtps_Export TransactionId {
   ACE_UINT8 data[12];
+  TransactionId()
+  {
+    std::memset(data, 0, sizeof data);
+  }
   bool operator<(const TransactionId& other) const;
   bool operator==(const TransactionId& other) const;
   bool operator!=(const TransactionId& other) const;
 };
+
+struct AttributeHolder {
+  Attribute& attribute;
+  const TransactionId& tid;
+
+  AttributeHolder(Attribute& a, const TransactionId& t)
+    : attribute(a)
+    , tid(t)
+  {}
+};
+
+struct ConstAttributeHolder {
+  const Attribute& attribute;
+  const TransactionId& tid;
+
+  ConstAttributeHolder(const Attribute& a, const TransactionId& t)
+    : attribute(a)
+    , tid(t)
+  {}
+};
+
+OpenDDS_Rtps_Export
+bool operator>>(DCPS::Serializer& serializer, AttributeHolder& holder);
+
+OpenDDS_Rtps_Export
+bool operator<<(DCPS::Serializer& serializer, ConstAttributeHolder& holder);
 
 struct OpenDDS_Rtps_Export Message {
   typedef std::vector<Attribute> AttributesType;
@@ -156,6 +180,8 @@ struct OpenDDS_Rtps_Export Message {
   : class_(REQUEST), method(BINDING), block(0), length_(0), length_for_message_integrity_(0) {}
 
   void generate_transaction_id();
+
+  void clear_transaction_id();
 
   void append_attribute(const Attribute& attribute)
   {

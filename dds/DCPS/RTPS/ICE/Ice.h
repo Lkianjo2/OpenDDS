@@ -27,10 +27,34 @@ typedef OPENDDS_VECTOR(ACE_INET_Addr) AddressListType;
 bool candidates_equal(const Candidate& x, const Candidate& y);
 bool candidates_sorted(const Candidate& x, const Candidate& y);
 
+ACE_UINT32 local_priority(const ACE_INET_Addr& addr);
+
 Candidate make_host_candidate(const ACE_INET_Addr& address);
 Candidate make_server_reflexive_candidate(const ACE_INET_Addr& address, const ACE_INET_Addr& base, const ACE_INET_Addr& server_address);
 Candidate make_peer_reflexive_candidate(const ACE_INET_Addr& address, const ACE_INET_Addr& base, const ACE_INET_Addr& server_address, ACE_UINT32 priority);
 Candidate make_peer_reflexive_candidate(const ACE_INET_Addr& address, ACE_UINT32 priority, size_t q);
+
+struct OpenDDS_Rtps_Export GuidPair {
+  DCPS::RepoId local;
+  DCPS::RepoId remote;
+
+  GuidPair(const DCPS::RepoId& a_local, const DCPS::RepoId& a_remote) : local(a_local), remote(a_remote) {}
+
+  bool operator<(const GuidPair& a_other) const
+  {
+    if (DCPS::GUID_tKeyLessThan()(this->local, a_other.local)) return true;
+
+    if (DCPS::GUID_tKeyLessThan()(a_other.local, this->local)) return false;
+
+    if (DCPS::GUID_tKeyLessThan()(this->remote, a_other.remote)) return true;
+
+    if (DCPS::GUID_tKeyLessThan()(a_other.remote, this->remote)) return false;
+
+    return false;
+  }
+};
+
+typedef std::set<GuidPair> GuidSetType;
 
 class OpenDDS_Rtps_Export Endpoint {
 public:
@@ -38,6 +62,8 @@ public:
   virtual AddressListType host_addresses() const = 0;
   virtual void send(const ACE_INET_Addr& address, const STUN::Message& message) = 0;
   virtual ACE_INET_Addr stun_server_address() const = 0;
+  virtual void ice_connect(const GuidSetType&, const ACE_INET_Addr&) {}
+  virtual void ice_disconnect(const GuidSetType&, const ACE_INET_Addr&) {}
 };
 
 class OpenDDS_Rtps_Export AgentInfoListener {
@@ -192,6 +218,8 @@ public:
                        const ACE_INET_Addr& a_local_address,
                        const ACE_INET_Addr& a_remote_address,
                        const STUN::Message& a_message) = 0;
+
+  virtual void shutdown() = 0;
 
   static Agent* instance();
 };

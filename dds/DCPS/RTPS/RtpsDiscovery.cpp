@@ -15,6 +15,7 @@
 #include "dds/DCPS/BuiltInTopicUtils.h"
 #include "dds/DCPS/Registered_Data_Types.h"
 #include "dds/DdsDcpsInfoUtilsC.h"
+#include "dds/DCPS/transport/framework/TransportSendStrategy.h"
 
 #include "ace/Reactor.h"
 #include "ace/Select_Reactor.h"
@@ -43,6 +44,8 @@ using DCPS::TimeDuration;
 
 RtpsDiscoveryConfig::RtpsDiscoveryConfig()
   : resend_period_(30 /*seconds*/) // see RTPS v2.1 9.6.1.4.2
+  , quick_resend_ratio_(0.1)
+  , min_resend_delay_(TimeDuration::from_msec(100))
   , lease_duration_(300)
   , pb_(7400) // see RTPS v2.1 9.6.1.3 for PB, DG, PG, D0, D1 defaults
   , dg_(250)
@@ -52,16 +55,25 @@ RtpsDiscoveryConfig::RtpsDiscoveryConfig()
   , dx_(2)
   , ttl_(1)
   , sedp_multicast_(true)
-  , default_multicast_group_("239.255.0.1") /*RTPS v2.1 9.6.1.4.1*/
+  , sedp_local_address_(u_short(0), "0.0.0.0")
+  , spdp_local_address_(u_short(0), "0.0.0.0")
+  , default_multicast_group_(u_short(0), "239.255.0.1") /*RTPS v2.1 9.6.1.4.1*/
+#ifdef ACE_HAS_IPV6
+  , ipv6_sedp_local_address_(u_short(0), "::")
+  , ipv6_spdp_local_address_(u_short(0), "::")
+  , ipv6_default_multicast_group_(u_short(0), "FF03::1")
+#endif
   , max_auth_time_(300, 0)
   , auth_resend_period_(1, 0)
   , max_spdp_sequence_msg_reset_check_(3)
   , spdp_rtps_relay_beacon_period_(30, 0)
-  , spdp_rtps_relay_send_period_(100, 0)
+  , spdp_rtps_relay_send_period_(30, 0)
   , sedp_rtps_relay_beacon_period_(30, 0)
   , use_rtps_relay_(false)
   , rtps_relay_only_(false)
   , use_ice_(false)
+  , use_ncm_(true)
+  , sedp_max_message_size_(DCPS::TransportSendStrategy::UDP_MAX_MESSAGE_SIZE)
 {}
 
 RtpsDiscovery::RtpsDiscovery(const RepoKey& key)
@@ -91,7 +103,7 @@ RtpsDiscovery::Config::discovery_config(ACE_Configuration_Heap& cf)
     if (DCPS::pullValues(cf, rtps_sect, vm) > 0) {
       // There are values inside [rtps_discovery]
       ACE_ERROR_RETURN((LM_ERROR,
-                        ACE_TEXT("(%P|%t) RtpsDiscovery::Config::discovery_config(): ")
+                        ACE_TEXT("(%P|%t) ERROR: RtpsDiscovery::Config::discovery_config(): ")
                         ACE_TEXT("rtps_discovery sections must have a subsection name\n")),
                        -1);
     }
@@ -99,7 +111,7 @@ RtpsDiscovery::Config::discovery_config(ACE_Configuration_Heap& cf)
     DCPS::KeyList keys;
     if (DCPS::processSections(cf, rtps_sect, keys) != 0) {
       ACE_ERROR_RETURN((LM_ERROR,
-                        ACE_TEXT("(%P|%t) RtpsDiscovery::Config::discovery_config(): ")
+                        ACE_TEXT("(%P|%t) ERROR: RtpsDiscovery::Config::discovery_config(): ")
                         ACE_TEXT("too many nesting layers in the [rtps] section.\n")),
                        -1);
     }
@@ -114,7 +126,15 @@ RtpsDiscovery::Config::discovery_config(ACE_Configuration_Heap& cf)
 
       // spdpaddr defaults to DCPSDefaultAddress if set
       if (!TheServiceParticipant->default_address().empty()) {
-        config->spdp_local_address(TheServiceParticipant->default_address().c_str());
+        ACE_INET_Addr addr;
+        if (addr.set(TheServiceParticipant->default_address().c_str())) {
+          ACE_ERROR_RETURN((LM_ERROR,
+                            ACE_TEXT("(%P|%t) ERROR: RtpsDiscovery::Config::discovery_config(): ")
+                            ACE_TEXT("failed to parse Service Participant default address %C\n"),
+                            TheServiceParticipant->default_address().c_str()),
+                           -1);
+        }
+        config->spdp_local_address(addr);
       }
 
       DCPS::ValueMap values;
@@ -133,6 +153,28 @@ RtpsDiscovery::Config::discovery_config(ACE_Configuration_Heap& cf)
               value.c_str(), rtps_name.c_str()), -1);
           }
           config->resend_period(TimeDuration(resend));
+        } else if (name == "QuickResendRatio") {
+          const OPENDDS_STRING& value = it->second;
+          double ratio;
+          if (!DCPS::convertToDouble(value, ratio)) {
+            ACE_ERROR_RETURN((LM_ERROR,
+              ACE_TEXT("(%P|%t) RtpsDiscovery::Config::discovery_config(): ")
+              ACE_TEXT("Invalid entry (%C) for QuickResendRatio in ")
+              ACE_TEXT("[rtps_discovery/%C] section.\n"),
+              value.c_str(), rtps_name.c_str()), -1);
+          }
+          config->quick_resend_ratio(ratio);
+        } else if (name == "MinResendDelay") {
+          const OPENDDS_STRING& value = it->second;
+          int delay;
+          if (!DCPS::convertToInteger(value, delay)) {
+            ACE_ERROR_RETURN((LM_ERROR,
+              ACE_TEXT("(%P|%t) RtpsDiscovery::Config::discovery_config(): ")
+              ACE_TEXT("Invalid entry (%C) for MinResendDelay in ")
+              ACE_TEXT("[rtps_discovery/%C] section.\n"),
+              value.c_str(), rtps_name.c_str()), -1);
+          }
+          config->min_resend_delay(TimeDuration::from_msec(delay));
         } else if (name == "LeaseDuration") {
           const OPENDDS_STRING& value = it->second;
           int duration;
@@ -235,14 +277,38 @@ RtpsDiscovery::Config::discovery_config(ACE_Configuration_Heap& cf)
         } else if (name == "MulticastInterface") {
           config->multicast_interface(it->second);
         } else if (name == "SedpLocalAddress") {
-          config->sedp_local_address(it->second);
+          ACE_INET_Addr addr;
+          if (addr.set(it->second.c_str())) {
+            ACE_ERROR_RETURN((LM_ERROR,
+                              ACE_TEXT("(%P|%t) ERROR: RtpsDiscovery::Config::discovery_config(): ")
+                              ACE_TEXT("failed to parse SedpLocalAddress %C\n"),
+                              it->second.c_str()),
+                             -1);
+          }
+          config->sedp_local_address(addr);
         } else if (name == "SpdpLocalAddress") {
-          config->spdp_local_address(it->second);
+          ACE_INET_Addr addr;
+          if (addr.set(it->second.c_str())) {
+            ACE_ERROR_RETURN((LM_ERROR,
+                              ACE_TEXT("(%P|%t) ERROR: RtpsDiscovery::Config::discovery_config(): ")
+                              ACE_TEXT("failed to parse SpdpLocalAddress %C\n"),
+                              it->second.c_str()),
+                             -1);
+          }
+          config->spdp_local_address(addr);
         } else if (name == "GuidInterface") {
           config->guid_interface(it->second);
         } else if (name == "InteropMulticastOverride") {
           /// FUTURE: handle > 1 group.
-          config->default_multicast_group(it->second);
+          ACE_INET_Addr addr;
+          if (addr.set(u_short(0), it->second.c_str())) {
+            ACE_ERROR_RETURN((LM_ERROR,
+                              ACE_TEXT("(%P|%t) ERROR: RtpsDiscovery::Config::discovery_config(): ")
+                              ACE_TEXT("failed to parse InteropMulticastOverride %C\n"),
+                              it->second.c_str()),
+                             -1);
+          }
+          config->default_multicast_group(addr);
         } else if (name == "SpdpSendAddrs") {
           AddrVec spdp_send_addrs;
           const OPENDDS_STRING& value = it->second;
@@ -255,7 +321,15 @@ RtpsDiscovery::Config::discovery_config(ACE_Configuration_Heap& cf)
           } while (i++ != OPENDDS_STRING::npos); // skip past comma if there is one
           config->spdp_send_addrs(spdp_send_addrs);
         } else if (name == "SpdpRtpsRelayAddress") {
-          config->spdp_rtps_relay_address(ACE_INET_Addr(it->second.c_str()));
+          ACE_INET_Addr addr;
+          if (addr.set(it->second.c_str())) {
+            ACE_ERROR_RETURN((LM_ERROR,
+                              ACE_TEXT("(%P|%t) ERROR: RtpsDiscovery::Config::discovery_config(): ")
+                              ACE_TEXT("failed to parse SpdpRtpsRelayAddress %C\n"),
+                              it->second.c_str()),
+                             -1);
+          }
+          config->spdp_rtps_relay_address(addr);
         } else if (name == "SpdpRtpsRelayBeaconPeriod") {
           const OPENDDS_STRING& value = it->second;
           int period;
@@ -279,7 +353,15 @@ RtpsDiscovery::Config::discovery_config(ACE_Configuration_Heap& cf)
           }
           config->spdp_rtps_relay_send_period(TimeDuration(period));
         } else if (name == "SedpRtpsRelayAddress") {
-          config->sedp_rtps_relay_address(ACE_INET_Addr(it->second.c_str()));
+          ACE_INET_Addr addr;
+          if (addr.set(it->second.c_str())) {
+            ACE_ERROR_RETURN((LM_ERROR,
+                              ACE_TEXT("(%P|%t) ERROR: RtpsDiscovery::Config::discovery_config(): ")
+                              ACE_TEXT("failed to parse SedpRtpsRelayAddress %C\n"),
+                              it->second.c_str()),
+                             -1);
+          }
+          config->sedp_rtps_relay_address(addr);
         } else if (name == "SedpRtpsRelayBeaconPeriod") {
           const OPENDDS_STRING& value = it->second;
           int period;
@@ -315,7 +397,15 @@ RtpsDiscovery::Config::discovery_config(ACE_Configuration_Heap& cf)
           config->use_rtps_relay(bool(smInt));
 #ifdef OPENDDS_SECURITY
         } else if (name == "SedpStunServerAddress") {
-          config->sedp_stun_server_address(ACE_INET_Addr(it->second.c_str()));
+          ACE_INET_Addr addr;
+          if (addr.set(it->second.c_str())) {
+            ACE_ERROR_RETURN((LM_ERROR,
+                              ACE_TEXT("(%P|%t) ERROR: RtpsDiscovery::Config::discovery_config(): ")
+                              ACE_TEXT("failed to parse SedpStunServerAddress %C\n"),
+                              it->second.c_str()),
+                             -1);
+          }
+          config->sedp_stun_server_address(addr);
         } else if (name == "UseIce") {
           const OPENDDS_STRING& value = it->second;
           int smInt;
@@ -327,6 +417,9 @@ RtpsDiscovery::Config::discovery_config(ACE_Configuration_Heap& cf)
                               value.c_str(), rtps_name.c_str()), -1);
           }
           config->use_ice(bool(smInt));
+          if (smInt && !TheServiceParticipant->get_security()) {
+            ACE_ERROR_RETURN((LM_ERROR, ACE_TEXT("(%P|%t) ERROR: Security must be enabled (-DCPSSecurity 1) when using ICE (UseIce)\n")), -1);
+          }
         } else if (name == "IceTa") {
           // In milliseconds.
           const OPENDDS_STRING& string_value = it->second;
@@ -477,10 +570,22 @@ RtpsDiscovery::Config::discovery_config(ACE_Configuration_Heap& cf)
             config->max_spdp_sequence_msg_reset_check(value);
           } else {
             ACE_ERROR_RETURN((LM_ERROR,
-              ACE_TEXT("(%P|%t) RtpsDiscovery::Config::discovery_config(): ")
-              ACE_TEXT("Invalid entry (%C) for MaxSpdpSequenceMsgResetChecks in ")
-              ACE_TEXT("[rtps_discovery/%C] section.\n"),
-              string_value.c_str(), rtps_name.c_str()), -1);
+                              ACE_TEXT("(%P|%t) RtpsDiscovery::Config::discovery_config(): ")
+                              ACE_TEXT("Invalid entry (%C) for MaxSpdpSequenceMsgResetChecks in ")
+                              ACE_TEXT("[rtps_discovery/%C] section.\n"),
+                              string_value.c_str(), rtps_name.c_str()), -1);
+          }
+        } else if (name == "SedpMaxMessageSize") {
+          const OPENDDS_STRING& string_value = it->second;
+          size_t value;
+          if (DCPS::convertToInteger(string_value, value)) {
+            config->sedp_max_message_size(value);
+          } else {
+            ACE_ERROR_RETURN((LM_ERROR,
+                              ACE_TEXT("(%P|%t) RtpsDiscovery::Config::discovery_config(): ")
+                              ACE_TEXT("Invalid entry (%C) for SedpMaxMessageSize in ")
+                              ACE_TEXT("[rtps_discovery/%C] section.\n"),
+                              string_value.c_str(), rtps_name.c_str()), -1);
           }
         } else {
           ACE_ERROR_RETURN((LM_ERROR,
@@ -635,6 +740,39 @@ RtpsDiscovery::get_sedp_port(DDS::DomainId_t domain,
   }
 
   return 0;
+}
+
+#ifdef ACE_HAS_IPV6
+
+u_short
+RtpsDiscovery::get_ipv6_spdp_port(DDS::DomainId_t domain,
+                                  const DCPS::RepoId& local_participant) const
+{
+  ParticipantHandle p = get_part(domain, local_participant);
+  if (p) {
+    return p->get_ipv6_spdp_port();
+  }
+
+  return 0;
+}
+
+u_short
+RtpsDiscovery::get_ipv6_sedp_port(DDS::DomainId_t domain,
+                                  const DCPS::RepoId& local_participant) const
+{
+  ParticipantHandle p = get_part(domain, local_participant);
+  if (p) {
+    return p->get_ipv6_sedp_port();
+  }
+
+  return 0;
+}
+#endif
+
+void
+RtpsDiscovery::spdp_rtps_relay_address(const ACE_INET_Addr& address)
+{
+  config_->spdp_rtps_relay_address(address);
 }
 
 void

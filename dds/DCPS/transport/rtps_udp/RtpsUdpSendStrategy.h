@@ -19,6 +19,7 @@
 #include "dds/DCPS/RTPS/MessageTypes.h"
 
 #include "ace/INET_Addr.h"
+#include "ace/SOCK_Dgram.h"
 
 OPENDDS_BEGIN_VERSIONED_NAMESPACE_DECL
 
@@ -64,17 +65,16 @@ protected:
 
   virtual size_t max_message_size() const
   {
-    return UDP_MAX_MESSAGE_SIZE;
+    return max_message_size_;
   }
 
   virtual void add_delayed_notification(TransportQueueElement* element);
-  virtual RemoveResult do_remove_sample(const RepoId& pub_id,
-    const TransportQueueElement::MatchCriteria& criteria);
 
 private:
   bool marshal_transport_header(ACE_Message_Block* mb);
   ssize_t send_multi_i(const iovec iov[], int n,
                        const OPENDDS_SET(ACE_INET_Addr)& addrs);
+  const ACE_SOCK_Dgram& choose_send_socket(const ACE_INET_Addr& addr) const;
   ssize_t send_single_i(const iovec iov[], int n,
                         const ACE_INET_Addr& addr);
 
@@ -116,6 +116,7 @@ private:
   const OPENDDS_SET(ACE_INET_Addr)* override_dest_;
   const ACE_INET_Addr* override_single_dest_;
 
+  const size_t max_message_size_;
   RTPS::Header rtps_header_;
   char rtps_header_data_[RTPS::RTPSHDR_SZ];
   ACE_Data_Block rtps_header_db_;

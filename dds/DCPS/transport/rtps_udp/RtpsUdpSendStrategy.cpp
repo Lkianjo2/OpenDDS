@@ -42,6 +42,7 @@ RtpsUdpSendStrategy::RtpsUdpSendStrategy(RtpsUdpDataLink* link,
     link_(link),
     override_dest_(0),
     override_single_dest_(0),
+    max_message_size_(link->config().max_message_size_),
     rtps_header_db_(RTPS::RTPSHDR_SZ, ACE_Message_Block::MB_DATA,
                     rtps_header_data_, 0, 0, ACE_Message_Block::DONT_DELETE, 0),
     rtps_header_mb_(&rtps_header_db_, ACE_Message_Block::DONT_DELETE),
@@ -224,11 +225,25 @@ RtpsUdpSendStrategy::send_multi_i(const iovec iov[], int n,
   return result;
 }
 
+const ACE_SOCK_Dgram&
+RtpsUdpSendStrategy::choose_send_socket(const ACE_INET_Addr& addr) const
+{
+#ifdef ACE_HAS_IPV6
+  if (addr.get_type() == AF_INET6) {
+    return link_->ipv6_unicast_socket();
+  }
+#endif
+  ACE_UNUSED_ARG(addr);
+  return link_->unicast_socket();
+}
+
 ssize_t
 RtpsUdpSendStrategy::send_single_i(const iovec iov[], int n,
                                    const ACE_INET_Addr& addr)
 {
   const ACE_INET_Addr a = link_->config().rtps_relay_only_ ? link_->config().rtps_relay_address() : addr;
+  const ACE_SOCK_Dgram& socket = choose_send_socket(a);
+
 #ifdef ACE_LACKS_SENDMSG
   char buffer[UDP_MAX_MESSAGE_SIZE];
   char *iter = buffer;
@@ -241,9 +256,9 @@ RtpsUdpSendStrategy::send_single_i(const iovec iov[], int n,
     std::memcpy(iter, iov[i].iov_base, iov[i].iov_len);
     iter += iov[i].iov_len;
   }
-  const ssize_t result = link_->unicast_socket().send(buffer, iter - buffer, a);
+  const ssize_t result = socket.send(buffer, iter - buffer, a);
 #else
-  const ssize_t result = link_->unicast_socket().send(iov, n, a);
+  const ssize_t result = socket.send(iov, n, a);
 #endif
   if (result < 0) {
     const int err = errno;
@@ -272,14 +287,6 @@ RtpsUdpSendStrategy::add_delayed_notification(TransportQueueElement* element)
   if (!link_->add_delayed_notification(element)) {
     TransportSendStrategy::add_delayed_notification(element);
   }
-}
-
-RemoveResult
-RtpsUdpSendStrategy::do_remove_sample(const RepoId& pub_id,
-  const TransportQueueElement::MatchCriteria& criteria)
-{
-  link_->do_remove_sample(pub_id, criteria);
-  return TransportSendStrategy::do_remove_sample(pub_id, criteria);
 }
 
 #ifdef OPENDDS_SECURITY

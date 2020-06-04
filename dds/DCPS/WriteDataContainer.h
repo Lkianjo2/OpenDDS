@@ -18,11 +18,14 @@
 #include "PoolAllocationBase.h"
 #include "Message_Block_Ptr.h"
 #include "TimeTypes.h"
+#include "SporadicTask.h"
+
 
 #include "ace/Synch_Traits.h"
 #include "ace/Condition_T.h"
 #include "ace/Condition_Thread_Mutex.h"
 #include "ace/Condition_Recursive_Thread_Mutex.h"
+#include "ace/Reverse_Lock_T.h"
 
 #include <memory>
 
@@ -116,7 +119,7 @@ typedef OPENDDS_MAP(DDS::InstanceHandle_t, PublicationInstance_rch)
  *           we do not deadlock; and, 2) we incur the cost of
  *           obtaining the lock only once.
  */
-class OpenDDS_Dcps_Export WriteDataContainer : public PoolAllocationBase {
+class OpenDDS_Dcps_Export WriteDataContainer : public RcObject {
 public:
 
   friend class DataWriterImpl;
@@ -152,7 +155,10 @@ public:
     /// maximum number of instances, 0 for unlimited
     CORBA::Long      max_instances,
     /// maximum total number of samples, 0 for unlimited
-    CORBA::Long      max_total_samples);
+    CORBA::Long      max_total_samples,
+    ACE_Recursive_Thread_Mutex& deadline_status_lock,
+    DDS::OfferedDeadlineMissedStatus& deadline_status,
+    CORBA::Long& deadline_last_total_count);
 
   ~WriteDataContainer();
 
@@ -249,13 +255,7 @@ public:
    * TRANSIENT_LOCAL_DURABILITY_QOS is used. The data on the list
    * returned is not put on any SendStateDataSampleList.
    */
-  SendStateDataSampleList get_resend_data() ;
-
-  /**
-   * Returns if pending data exists.  This includes
-   * sending, and unsent data.
-   */
-  bool pending_data();
+  SendStateDataSampleList get_resend_data();
 
   /**
    * Acknowledge the delivery of data.  The sample that resides in
@@ -294,7 +294,7 @@ public:
    * to remove oldest samples (forcing the transport to drop samples if necessary)
    * to make space.  If there are several threads waiting then
    * the first one in the waiting list can enqueue, others continue
-   * waiting.
+   * waiting. Note: the lock should be held before calling this method
    */
   DDS::ReturnCode_t obtain_buffer(
     DataSampleElement*& element,
@@ -326,9 +326,6 @@ public:
   bool persist_data();
 #endif
 
-  /// Reset time interval for each instance.
-  void reschedule_deadline();
-
   /**
    * Block until pending samples have either been delivered
    * or dropped.
@@ -358,6 +355,12 @@ private:
   WriteDataContainer(WriteDataContainer const &);
   WriteDataContainer & operator= (WriteDataContainer const &);
   // --------------------------
+
+  /**
+   * Returns if pending data exists.  This includes
+   * sending, and unsent data.
+   */
+  bool pending_data();
 
   void copy_and_prepend(SendStateDataSampleList& list,
                         const SendStateDataSampleList& appended,
@@ -528,6 +531,26 @@ private:
   DDS::DurabilityServiceQosPolicy const & durability_service_;
 
 #endif
+
+  /// Timer responsible for reporting missed offered deadlines.
+  RcHandle<DCPS::PmfSporadicTask<WriteDataContainer> > deadline_task_;
+  TimeDuration deadline_period_; // TimeDuration::zero_value means no deadline.
+  typedef OPENDDS_MULTIMAP(MonotonicTimePoint, PublicationInstance_rch) DeadlineMapType;
+  DeadlineMapType deadline_map_;
+
+  /// Lock for synchronization of @c status_ member.
+  ACE_Recursive_Thread_Mutex& deadline_status_lock_;
+
+  /// Reference to the missed requested deadline status structure.
+  DDS::OfferedDeadlineMissedStatus& deadline_status_;
+
+  /// Last total_count when status was last checked.
+  CORBA::Long& deadline_last_total_count_;
+
+  void set_deadline_period(const TimeDuration& deadline_period);
+  void process_deadlines(const MonotonicTimePoint& now);
+  void extend_deadline(const PublicationInstance_rch& instance);
+  void cancel_deadline(const PublicationInstance_rch& instance);
 };
 
 } /// namespace OpenDDS

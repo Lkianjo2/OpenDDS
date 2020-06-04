@@ -77,9 +77,6 @@ typedef Cached_Allocator_With_Overflow<ACE_Data_Block, ACE_Thread_Mutex> DataBlo
 struct DataSampleHeader;
 typedef Cached_Allocator_With_Overflow<DataSampleHeader, ACE_Null_Mutex> DataSampleHeaderAllocator;
 
-#define DUP true
-#define NO_DUP false
-
 /// This struct holds both object reference and the corresponding servant.
 template <typename T_impl, typename T, typename T_ptr, typename T_var>
 struct Objref_Servant_Pair {
@@ -121,6 +118,11 @@ struct VarLess : public std::binary_function<V, V, bool> {
     return x.in() < y.in();
   }
 };
+
+/// Size of TCHAR buffer for use with ACE::timestamp, e.g.,
+///  ACE_TCHAR buffer[AceTimestampSize];
+///  ACE::timestamp(buffer, AceTimestampSize);
+const size_t AceTimestampSize = 27;
 
 } // namespace OpenDDS
 } // namespace DCPS

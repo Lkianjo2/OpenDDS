@@ -38,6 +38,7 @@ namespace OpenDDS {
     typedef DataReaderImpl_T<DDS::ParticipantBuiltinTopicData> ParticipantBuiltinTopicDataDataReaderImpl;
     typedef DataReaderImpl_T<DDS::PublicationBuiltinTopicData> PublicationBuiltinTopicDataDataReaderImpl;
     typedef DataReaderImpl_T<DDS::SubscriptionBuiltinTopicData> SubscriptionBuiltinTopicDataDataReaderImpl;
+    typedef DataReaderImpl_T<ParticipantLocationBuiltinTopicData> ParticipantLocationBuiltinTopicDataDataReaderImpl;
     typedef DataReaderImpl_T<DDS::TopicBuiltinTopicData> TopicBuiltinTopicDataDataReaderImpl;
 
 #ifdef OPENDDS_SECURITY
@@ -1155,7 +1156,7 @@ namespace OpenDDS {
           if (call_writer) {
             if (DCPS_debug_level > 3) {
               ACE_DEBUG((LM_DEBUG, ACE_TEXT("(%P|%t) EndpointManager::match - ")
-                         ACE_TEXT("adding writer association\n")));
+                         ACE_TEXT("adding writer %C association for reader %C\n"), OPENDDS_STRING(GuidConverter(writer)).c_str(), OPENDDS_STRING(GuidConverter(reader)).c_str()));
             }
             DcpsUpcalls thr(drr, reader, wa, !writer_active, dwr);
             if (call_reader) {
@@ -1169,7 +1170,7 @@ namespace OpenDDS {
           } else if (call_reader) {
             if (DCPS_debug_level > 3) {
               ACE_DEBUG((LM_DEBUG, ACE_TEXT("(%P|%t) EndpointManager::match - ")
-                         ACE_TEXT("adding reader association\n")));
+                         ACE_TEXT("adding reader %C association for writer %C\n"), OPENDDS_STRING(GuidConverter(reader)).c_str(), OPENDDS_STRING(GuidConverter(writer)).c_str()));
             }
             drr->add_association(reader, wa, !writer_active);
           }
@@ -1179,7 +1180,7 @@ namespace OpenDDS {
             if (DCPS_debug_level > 3) {
               ACE_DEBUG((LM_DEBUG,
                          ACE_TEXT("(%P|%t) EndpointManager::match - ")
-                         ACE_TEXT("calling writer association_complete\n")));
+                         ACE_TEXT("calling writer %C association_complete for %C\n"), OPENDDS_STRING(GuidConverter(writer)).c_str(), OPENDDS_STRING(GuidConverter(reader)).c_str()));
             }
             dwr->association_complete(reader);
           }
@@ -1580,7 +1581,8 @@ namespace OpenDDS {
       struct DiscoveredParticipant {
 
         DiscoveredParticipant()
-        : bit_ih_(DDS::HANDLE_NIL)
+        : location_ih_(DDS::HANDLE_NIL)
+        , bit_ih_(DDS::HANDLE_NIL)
         , seq_reset_count_(0)
 #ifdef OPENDDS_SECURITY
         , has_last_stateless_msg_(false)
@@ -1602,6 +1604,7 @@ namespace OpenDDS {
           const MonotonicTimePoint& t,
           const SequenceNumber& seq)
         : pdata_(p)
+        , location_ih_(DDS::HANDLE_NIL)
         , last_seen_(t)
         , bit_ih_(DDS::HANDLE_NIL)
         , last_seq_(seq)
@@ -1615,6 +1618,25 @@ namespace OpenDDS {
         , crypto_handle_(DDS::HANDLE_NIL)
 #endif
         {
+          RepoId guid;
+          std::memcpy(guid.guidPrefix, p.participantProxy.guidPrefix, sizeof(p.participantProxy.guidPrefix));
+          guid.entityId = DCPS::ENTITYID_PARTICIPANT;
+          std::memcpy(location_data_.guid, &guid, sizeof(guid));
+          location_data_.location = 0;
+          location_data_.change_mask = 0;
+          location_data_.local_timestamp.sec = 0;
+          location_data_.local_timestamp.nanosec = 0;
+          location_data_.ice_timestamp.sec = 0;
+          location_data_.ice_timestamp.nanosec = 0;
+          location_data_.relay_timestamp.sec = 0;
+          location_data_.relay_timestamp.nanosec = 0;
+          location_data_.local6_timestamp.sec = 0;
+          location_data_.local6_timestamp.nanosec = 0;
+          location_data_.ice6_timestamp.sec = 0;
+          location_data_.ice6_timestamp.nanosec = 0;
+          location_data_.relay6_timestamp.sec = 0;
+          location_data_.relay6_timestamp.nanosec = 0;
+
 #ifdef OPENDDS_SECURITY
           security_info_.participant_security_attributes = 0;
           security_info_.plugin_participant_security_attributes = 0;
@@ -1622,6 +1644,19 @@ namespace OpenDDS {
         }
 
         DiscoveredParticipantData pdata_;
+        struct LocationUpdate {
+          ParticipantLocation mask_;
+          ACE_INET_Addr from_;
+          LocationUpdate() {}
+          LocationUpdate(ParticipantLocation mask,
+                         const ACE_INET_Addr& from)
+            : mask_(mask), from_(from) {}
+        };
+        typedef OPENDDS_VECTOR(LocationUpdate) LocationUpdateList;
+        LocationUpdateList location_updates_;
+        ParticipantLocationBuiltinTopicData location_data_;
+        DDS::InstanceHandle_t location_ih_;
+
         MonotonicTimePoint last_seen_;
         DDS::InstanceHandle_t bit_ih_;
         SequenceNumber last_seq_;
@@ -1631,6 +1666,7 @@ namespace OpenDDS {
         bool has_last_stateless_msg_;
         MonotonicTimePoint stateless_msg_deadline_;
         DDS::Security::ParticipantStatelessMessage last_stateless_msg_;
+        DDS::Security::HandshakeMessageToken last_handshake_request_data_;
 
         MonotonicTimePoint auth_deadline_;
         AuthState auth_state_;
@@ -1650,7 +1686,6 @@ namespace OpenDDS {
         DDS::Security::ParticipantCryptoHandle crypto_handle_;
         DDS::Security::ParticipantCryptoTokenSeq crypto_tokens_;
 #endif
-
       };
 
       typedef OPENDDS_MAP_CMP(RepoId, DiscoveredParticipant,
@@ -1668,14 +1703,34 @@ namespace OpenDDS {
 
       void remove_discovered_participant(DiscoveredParticipantIter iter)
       {
+        RepoId part_id = iter->first;
         bool removed = endpoint_manager().disassociate(iter->second.pdata_);
+        iter = participants_.find(part_id); // refresh iter after disassociate, which can unlock
+        if (iter == participants_.end()) {
+          return;
+        }
         if (removed) {
 #ifndef DDS_HAS_MINIMUM_BIT
           ParticipantBuiltinTopicDataDataReaderImpl* bit = part_bit();
+          ParticipantLocationBuiltinTopicDataDataReaderImpl* loc_bit = part_loc_bit();
           // bit may be null if the DomainParticipant is shutting down
-          if (bit && iter->second.bit_ih_ != DDS::HANDLE_NIL) {
-            bit->set_instance_state(iter->second.bit_ih_,
-                                    DDS::NOT_ALIVE_DISPOSED_INSTANCE_STATE);
+          if ((bit && iter->second.bit_ih_ != DDS::HANDLE_NIL) ||
+              (loc_bit && iter->second.location_ih_ != DDS::HANDLE_NIL)) {
+            {
+              ACE_Reverse_Lock<ACE_Thread_Mutex> rev_lock(lock_);
+              if (bit && iter->second.bit_ih_ != DDS::HANDLE_NIL) {
+                bit->set_instance_state(iter->second.bit_ih_,
+                                        DDS::NOT_ALIVE_DISPOSED_INSTANCE_STATE);
+              }
+              if (loc_bit && iter->second.location_ih_ != DDS::HANDLE_NIL) {
+                loc_bit->set_instance_state(iter->second.location_ih_,
+                                            DDS::NOT_ALIVE_DISPOSED_INSTANCE_STATE);
+              }
+            }
+            iter = participants_.find(part_id);
+            if (iter == participants_.end()) {
+              return;
+            }
           }
 #endif /* DDS_HAS_MINIMUM_BIT */
           if (DCPS_debug_level > 3) {
@@ -1688,15 +1743,25 @@ namespace OpenDDS {
       }
 
 #ifndef DDS_HAS_MINIMUM_BIT
-      ParticipantBuiltinTopicDataDataReaderImpl* part_bit()
-      {
-        if (!bit_subscriber_.in())
-          return 0;
+    DCPS::ParticipantBuiltinTopicDataDataReaderImpl* part_bit()
+    {
+      if (!bit_subscriber_.in())
+        return 0;
 
-        DDS::DataReader_var d =
-          bit_subscriber_->lookup_datareader(BUILT_IN_PARTICIPANT_TOPIC);
-        return dynamic_cast<ParticipantBuiltinTopicDataDataReaderImpl*>(d.in());
-      }
+      DDS::DataReader_var d =
+        bit_subscriber_->lookup_datareader(BUILT_IN_PARTICIPANT_TOPIC);
+      return dynamic_cast<ParticipantBuiltinTopicDataDataReaderImpl*>(d.in());
+    }
+
+    DCPS::ParticipantLocationBuiltinTopicDataDataReaderImpl* part_loc_bit()
+    {
+      if (!bit_subscriber_.in())
+        return 0;
+
+      DDS::DataReader_var d =
+        bit_subscriber_->lookup_datareader(DCPS::BUILT_IN_PARTICIPANT_LOCATION_TOPIC);
+      return dynamic_cast<ParticipantLocationBuiltinTopicDataDataReaderImpl*>(d.in());
+    }
 #endif /* DDS_HAS_MINIMUM_BIT */
 
       mutable ACE_Thread_Mutex lock_;
@@ -1763,6 +1828,11 @@ namespace OpenDDS {
           participant->lookup_topicdescription(BUILT_IN_SUBSCRIPTION_TOPIC);
         create_bit_dr(bit_sub_topic, BUILT_IN_SUBSCRIPTION_TOPIC_TYPE,
                       sub, dr_qos);
+
+    DDS::TopicDescription_var bit_part_loc_topic =
+      participant->lookup_topicdescription(BUILT_IN_PARTICIPANT_LOCATION_TOPIC);
+    create_bit_dr(bit_part_loc_topic, BUILT_IN_PARTICIPANT_LOCATION_TOPIC_TYPE,
+      sub, dr_qos);
 
         const DDS::ReturnCode_t ret = bit_subscriber->enable();
         if (ret != DDS::RETCODE_OK) {
